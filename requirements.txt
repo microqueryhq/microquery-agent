@@ -1,0 +1,7 @@
+requests>=2.32
+web3>=6.0
+eth-account>=0.10
+python-dotenv>=1.0
+
+# Optional: enables Claude-powered SQL generation (set ANTHROPIC_API_KEY to activate)
+# anthropic>=0.40
