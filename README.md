@@ -8,6 +8,14 @@ discover databases → run queries → auto top-up balance.
 **No ETH required.** Top-ups use an [EIP-2612][] permit signed off-chain; the
 operator submits the on-chain transaction.
 
+## See also
+
+[microquery-agent-x402](https://github.com/microqueryhq/microquery-agent-x402) —
+the x402 variant: no registration, no web3 dependency, pays via EIP-3009
+`TransferWithAuthorization`. Supports a per-query challenge-response mode
+(no upfront deposit) and a deposit-first mode. Use this if you want to skip
+registration or avoid the permit nonce lookup.
+
 ## Prerequisites
 
 - Python 3.11+
