@@ -3,16 +3,15 @@
 microquery-agent -- reference implementation of the Microquery agent lifecycle.
 
 Lifecycle:
-    1. Register an Ethereum wallet address -> receive account_id
-    2. Deposit USDC into the MicroqueryEscrow contract
-    3. Discover available databases via GET /v1/databases
-    4. Run queries; track cost from X-Microquery-Cost-MicroUSDC response header
-    5. Top up balance when it falls below TOPUP_THRESHOLD_USDC
+    1. Register (POST /v1/register) -> api_key + 100,000 µUSDC trial credit ($0.10)
+    2. Discover databases (GET /v1/databases)
+    3. Run queries via GET /query (Bearer token auth)
+    4. Track cost from X-Microquery-* headers; top up via EIP-2612 permit when low
+       (sign Permit off-chain; operator submits depositWithPermit on-chain — no ETH needed)
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sys
@@ -21,9 +20,6 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from eth_account import Account
-from eth_account.messages import encode_typed_data
-from web3 import Web3
 
 load_dotenv()
 
@@ -31,111 +27,95 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-BASE_URL = os.environ.get("MICROQUERY_BASE_URL", "https://api.microquery.dev")
-PRIVATE_KEY = os.environ["WALLET_PRIVATE_KEY"]
-RPC_URL = os.environ.get("RPC_URL", "https://sepolia.base.org")
+BASE_URL = os.environ.get("MICROQUERY_BASE_URL", "https://microquery.dev")
+AGENT_NAME = os.environ.get("AGENT_NAME", "microquery-agent")
+PRIVATE_KEY = os.environ.get("WALLET_PRIVATE_KEY")  # optional; required for top-ups
+RPC_URL = os.environ.get("RPC_URL", "https://mainnet.base.org")
 TOPUP_AMOUNT_USDC = float(os.environ.get("TOPUP_AMOUNT_USDC", "2"))
 TOPUP_THRESHOLD_USDC = float(os.environ.get("TOPUP_THRESHOLD_USDC", "0.50"))
 
-CHAIN_ID = 84532  # Base Sepolia
-USDC_ADDRESS = Web3.to_checksum_address(
-    os.environ.get("USDC_ADDRESS", "0x036CbD53842c5426634e7929541eC2318f3dCF7e")
+CHAIN_ID = 8453  # Base mainnet
+USDC_ADDRESS = os.environ.get(
+    "USDC_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 )
-ESCROW_ADDRESS = Web3.to_checksum_address(
-    os.environ.get("ESCROW_ADDRESS", "0x0000000000000000000000000000000000000000")
+ESCROW_ADDRESS = os.environ.get(
+    "ESCROW_ADDRESS", "0xb1f8eE89bc8E51558a3C2A216620aBa1b7B2d01A"
 )
 
 MICRO_USDC_PER_USDC = 1_000_000  # USDC has 6 decimals
 
 # ---------------------------------------------------------------------------
-# ABIs
+# EIP-2612 permit deposit
 # ---------------------------------------------------------------------------
 
-ERC20_ABI = [
+_USDC_NONCES_ABI = [
     {
-        "name": "approve",
-        "type": "function",
-        "stateMutability": "nonpayable",
-        "inputs": [
-            {"name": "spender", "type": "address"},
-            {"name": "amount", "type": "uint256"},
-        ],
-        "outputs": [{"name": "", "type": "bool"}],
-    },
-    {
-        "name": "allowance",
+        "name": "nonces",
         "type": "function",
         "stateMutability": "view",
-        "inputs": [
-            {"name": "owner", "type": "address"},
-            {"name": "spender", "type": "address"},
-        ],
+        "inputs": [{"name": "owner", "type": "address"}],
         "outputs": [{"name": "", "type": "uint256"}],
-    },
+    }
 ]
 
-ESCROW_ABI = [
-    {
-        "name": "deposit",
-        "type": "function",
-        "stateMutability": "nonpayable",
-        "inputs": [
-            {"name": "accountId", "type": "bytes32"},
-            {"name": "amount", "type": "uint256"},
-        ],
-        "outputs": [],
-    },
-]
 
-# ---------------------------------------------------------------------------
-# EIP-712 request signing
-# ---------------------------------------------------------------------------
+def _usdc_permit_nonce(owner_addr: str) -> int:
+    """Fetch the owner's current EIP-2612 permit nonce from the USDC contract."""
+    from web3 import Web3
 
-_EIP712_DOMAIN = {
-    "name": "Microquery",
-    "version": "1",
-    "chainId": CHAIN_ID,
-}
-
-_EIP712_TYPES = {
-    "EIP712Domain": [
-        {"name": "name", "type": "string"},
-        {"name": "version", "type": "string"},
-        {"name": "chainId", "type": "uint256"},
-    ],
-    "ApiRequest": [
-        {"name": "accountId", "type": "string"},
-        {"name": "method", "type": "string"},
-        {"name": "path", "type": "string"},
-        {"name": "bodyHash", "type": "bytes32"},
-        {"name": "timestamp", "type": "uint256"},
-    ],
-}
+    w3 = Web3(Web3.HTTPProvider(RPC_URL))
+    usdc = w3.eth.contract(
+        address=Web3.to_checksum_address(USDC_ADDRESS), abi=_USDC_NONCES_ABI
+    )
+    return usdc.functions.nonces(Web3.to_checksum_address(owner_addr)).call()
 
 
-def _sign_request(
-    account_id: str, method: str, path: str, body: bytes, private_key: str
-) -> tuple[str, int]:
-    """Sign an API request with EIP-712; return (hex_signature, unix_timestamp)."""
-    timestamp = int(time.time())
-    body_hash = hashlib.sha256(body).digest()  # 32 bytes
+def _sign_permit(
+    owner: str, value: int, nonce: int, deadline: int, private_key: str
+) -> tuple[int, str, str]:
+    """
+    Sign an EIP-2612 Permit for the MicroqueryEscrow spender.
+    Returns (v, r_hex, s_hex). No on-chain transaction or ETH is required.
+    """
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
 
     structured_data = {
-        "types": _EIP712_TYPES,
-        "domain": _EIP712_DOMAIN,
-        "primaryType": "ApiRequest",
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+            "Permit": [
+                {"name": "owner", "type": "address"},
+                {"name": "spender", "type": "address"},
+                {"name": "value", "type": "uint256"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "deadline", "type": "uint256"},
+            ],
+        },
+        "domain": {
+            "name": "USD Coin",
+            "version": "2",
+            "chainId": CHAIN_ID,
+            "verifyingContract": USDC_ADDRESS,
+        },
+        "primaryType": "Permit",
         "message": {
-            "accountId": account_id,
-            "method": method.upper(),
-            "path": path,
-            "bodyHash": body_hash,
-            "timestamp": timestamp,
+            "owner": owner,
+            "spender": ESCROW_ADDRESS,
+            "value": value,
+            "nonce": nonce,
+            "deadline": deadline,
         },
     }
 
     signable = encode_typed_data(full_message=structured_data)
     signed = Account.sign_message(signable, private_key=private_key)
-    return signed.signature.hex(), timestamp
+    sig = bytes(signed.signature)
+    return signed.v, "0x" + sig[:32].hex(), "0x" + sig[32:64].hex()
 
 
 # ---------------------------------------------------------------------------
@@ -144,108 +124,76 @@ def _sign_request(
 
 
 class MicroqueryClient:
-    def __init__(self, base_url: str, private_key: str) -> None:
+    def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
-        self.account = Account.from_key(private_key)
-        self._private_key = private_key
+        self.api_key: str | None = None
         self.account_id: str | None = None
+        self._wallet_addr: str | None = None
 
-    def _auth_headers(self, method: str, path: str, body: bytes) -> dict[str, str]:
-        if not self.account_id:
-            raise RuntimeError("call register() before making authenticated requests")
-        sig, ts = _sign_request(self.account_id, method, path, body, self._private_key)
-        return {
-            "Authorization": f"EIP712 {self.account_id}.{ts}.{sig}",
-            "Content-Type": "application/json",
-        }
+    def register(self, name: str, wallet_addr: str | None = None) -> dict:
+        """Register and store api_key; returns full registration response."""
+        payload: dict[str, Any] = {"name": name}
+        if wallet_addr:
+            payload["wallet_addr"] = wallet_addr
+        resp = requests.post(f"{self.base_url}/v1/register", json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        self.api_key = data["api_key"]
+        self.account_id = data["id"]
+        self._wallet_addr = data.get("wallet_addr")
+        balance_usdc = data["balance"] / MICRO_USDC_PER_USDC
+        print(f"registered: id={self.account_id}  balance={balance_usdc:.4f} USDC trial credit")
+        return data
 
-    def _call(
-        self,
-        method: str,
-        path: str,
-        payload: Any = None,
-        *,
-        authenticated: bool = True,
-    ) -> requests.Response:
-        body = json.dumps(payload).encode() if payload is not None else b""
-        headers = (
-            self._auth_headers(method, path, body)
-            if authenticated
-            else {"Content-Type": "application/json"}
+    def databases(self) -> list[dict]:
+        """Return available databases with table schemas."""
+        resp = requests.get(f"{self.base_url}/v1/databases", timeout=30)
+        resp.raise_for_status()
+        return resp.json().get("databases", [])
+
+    def query(self, database: str, sql: str) -> tuple[list[dict], float, float]:
+        """
+        Run a SQL query; return (rows, cost_usdc, balance_usdc).
+        Response is newline-delimited JSON (one object per row).
+        """
+        resp = requests.get(
+            f"{self.base_url}/query",
+            params={"database": database, "query": sql},
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=60,
         )
-        resp = requests.request(
-            method,
-            self.base_url + path,
-            data=body or None,
-            headers=headers,
+        resp.raise_for_status()
+        cost = int(resp.headers.get("X-Microquery-Cost-MicroUSDC", 0)) / MICRO_USDC_PER_USDC
+        balance = int(resp.headers.get("X-Microquery-Balance-MicroUSDC", 0)) / MICRO_USDC_PER_USDC
+        rows = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
+        return rows, cost, balance
+
+    def deposit(self, amount_usdc: float) -> None:
+        """
+        Deposit USDC via EIP-2612 permit (no ETH gas required from agent).
+        Requires a linked wallet; operator submits the depositWithPermit tx.
+        """
+        if not self._wallet_addr or not PRIVATE_KEY:
+            raise RuntimeError("deposit requires a linked wallet (set WALLET_PRIVATE_KEY)")
+
+        amount_raw = int(amount_usdc * MICRO_USDC_PER_USDC)
+        deadline = int(time.time()) + 3600
+        nonce = _usdc_permit_nonce(self._wallet_addr)
+        v, r, s = _sign_permit(self._wallet_addr, amount_raw, nonce, deadline, PRIVATE_KEY)
+
+        resp = requests.post(
+            f"{self.base_url}/v1/deposit",
+            json={"amount": amount_raw, "deadline": deadline, "v": v, "r": r, "s": s},
+            headers={"Authorization": f"Bearer {self.api_key}"},
             timeout=30,
         )
         resp.raise_for_status()
-        return resp
-
-    def register(self) -> str:
-        """Register the wallet and store the returned account_id."""
-        resp = self._call(
-            "POST",
-            "/v1/register",
-            {"wallet_address": self.account.address},
-            authenticated=False,
+        data = resp.json()
+        balance_usdc = data.get("balance", 0) / MICRO_USDC_PER_USDC
+        print(
+            f"deposited {amount_usdc} USDC  "
+            f"balance={balance_usdc:.4f} USDC  tx={data.get('tx_hash')}"
         )
-        self.account_id = resp.json()["account_id"]
-        print(f"registered: account_id={self.account_id}  wallet={self.account.address}")
-        return self.account_id
-
-    def databases(self) -> list[dict]:
-        """Return available databases and their schemas."""
-        return self._call("GET", "/v1/databases").json()
-
-    def query(self, database_id: str, sql: str) -> tuple[dict, float, float]:
-        """Run a SQL query; return (result, cost_usdc, balance_usdc)."""
-        resp = self._call("POST", "/v1/query", {"database_id": database_id, "sql": sql})
-        cost = int(resp.headers.get("X-Microquery-Cost-MicroUSDC", 0)) / MICRO_USDC_PER_USDC
-        balance = int(resp.headers.get("X-Microquery-Balance-MicroUSDC", 0)) / MICRO_USDC_PER_USDC
-        return resp.json(), cost, balance
-
-
-# ---------------------------------------------------------------------------
-# Blockchain: USDC deposit into MicroqueryEscrow
-# ---------------------------------------------------------------------------
-
-
-def _account_id_to_bytes32(account_id: str) -> bytes:
-    """Convert an account_id to a 32-byte value for the escrow contract."""
-    raw = account_id.lstrip("0x")
-    if len(raw) == 64 and all(c in "0123456789abcdefABCDEF" for c in raw):
-        return bytes.fromhex(raw)
-    # Non-hex account_id (e.g. UUID): hash it to bytes32
-    return hashlib.sha256(account_id.encode()).digest()
-
-
-def deposit_usdc(w3: Web3, account: Any, account_id: str, amount_usdc: float) -> None:
-    """Approve USDC to the escrow contract and call MicroqueryEscrow.deposit()."""
-    amount_raw = int(amount_usdc * MICRO_USDC_PER_USDC)
-    account_id_b32 = _account_id_to_bytes32(account_id)
-
-    usdc = w3.eth.contract(address=USDC_ADDRESS, abi=ERC20_ABI)
-    escrow = w3.eth.contract(address=ESCROW_ADDRESS, abi=ESCROW_ABI)
-
-    nonce = w3.eth.get_transaction_count(account.address)
-
-    tx = usdc.functions.approve(ESCROW_ADDRESS, amount_raw).build_transaction(
-        {"from": account.address, "nonce": nonce, "chainId": CHAIN_ID}
-    )
-    signed = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    w3.eth.wait_for_transaction_receipt(tx_hash)
-    print(f"approved {amount_usdc} USDC  tx={tx_hash.hex()}")
-
-    tx = escrow.functions.deposit(account_id_b32, amount_raw).build_transaction(
-        {"from": account.address, "nonce": nonce + 1, "chainId": CHAIN_ID}
-    )
-    signed = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    w3.eth.wait_for_transaction_receipt(tx_hash)
-    print(f"deposited {amount_usdc} USDC  tx={tx_hash.hex()}")
 
 
 # ---------------------------------------------------------------------------
@@ -291,42 +239,44 @@ def _pick_sql(database: dict) -> str:
 
 
 def main() -> None:
-    client = MicroqueryClient(BASE_URL, PRIVATE_KEY)
-    w3 = Web3(Web3.HTTPProvider(RPC_URL))
+    wallet_addr: str | None = None
+    if PRIVATE_KEY:
+        from eth_account import Account
+        wallet_addr = Account.from_key(PRIVATE_KEY).address
 
-    # 1. Register
-    client.register()
+    client = MicroqueryClient(BASE_URL)
 
-    # 2. Initial deposit
-    deposit_usdc(w3, client.account, client.account_id, TOPUP_AMOUNT_USDC)
+    # 1. Register (trial credit: 100,000 µUSDC = $0.10, ~1,600 typical queries)
+    client.register(AGENT_NAME, wallet_addr)
 
-    # 3. Discover databases
+    # 2. Discover databases
     dbs = client.databases()
     if not dbs:
         print("no databases available")
         sys.exit(0)
-    print(f"found {len(dbs)} database(s)")
+    print(f"found {len(dbs)} database(s): {', '.join(db['name'] for db in dbs)}")
 
-    # 4. Query loop
-    balance = TOPUP_AMOUNT_USDC
+    # 3. Query loop
     for db in dbs:
         sql = _pick_sql(db)
-        print(f"\ndatabase={db.get('id')}  sql={sql!r}")
+        print(f"\ndatabase={db['name']}  sql={sql!r}")
 
-        result, cost, balance = client.query(db["id"], sql)
-        print(
-            f"  rows={len(result.get('rows', []))}  "
-            f"cost={cost:.6f} USDC  balance={balance:.6f} USDC"
-        )
+        rows, cost, balance = client.query(db["name"], sql)
+        print(f"  rows={len(rows)}  cost={cost:.6f} USDC  balance={balance:.6f} USDC")
 
-        # 5. Top up if balance is low
+        # 4. Top up if balance is low
         if balance < TOPUP_THRESHOLD_USDC:
+            if not PRIVATE_KEY:
+                print(
+                    f"balance {balance:.6f} USDC is low -- "
+                    "set WALLET_PRIVATE_KEY to enable auto top-up"
+                )
+                break
             print(
                 f"balance {balance:.6f} USDC is below threshold "
                 f"{TOPUP_THRESHOLD_USDC} USDC -- depositing {TOPUP_AMOUNT_USDC} USDC"
             )
-            deposit_usdc(w3, client.account, client.account_id, TOPUP_AMOUNT_USDC)
-            balance += TOPUP_AMOUNT_USDC
+            client.deposit(TOPUP_AMOUNT_USDC)
 
 
 if __name__ == "__main__":
